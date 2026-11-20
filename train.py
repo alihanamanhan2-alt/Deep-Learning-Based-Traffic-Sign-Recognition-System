@@ -50,24 +50,12 @@ def build_model(num_classes):
     return model
 
 
-def load_class_names():
-    path = os.path.join(DATA_DIR, "class_names.json")
-    if os.path.exists(path):
-        with open(path, "r", encoding="utf-8") as file:
-            return json.load(file)
-
+def main():
     train_dir = os.path.join(DATA_DIR, "Train")
     if not os.path.isdir(train_dir):
         raise FileNotFoundError(
-            "data/Train каталогын табу мүмкін емес. GTSRB деректерін data каталогына орналастырыңыз."
+            "data/Train каталогын табу мүмкін емес. GTSRB деректерін README нұсқаулығына сай орналастырыңыз."
         )
-
-    names = [f"Сынып {i}" for i in range(len(os.listdir(train_dir)))]
-    return names
-
-
-def main():
-    train_dir = os.path.join(DATA_DIR, "Train")
 
     datagen = ImageDataGenerator(
         rescale=1.0 / 255,
@@ -99,23 +87,16 @@ def main():
         seed=SEED
     )
 
+    if train_data.num_classes < 2:
+        raise ValueError("Оқыту деректерінде кемінде екі сынып болуы керек.")
+
     os.makedirs(MODEL_DIR, exist_ok=True)
     model_path = os.path.join(MODEL_DIR, "traffic_sign_model.keras")
-
     model = build_model(train_data.num_classes)
 
     callbacks = [
-        EarlyStopping(
-            monitor="val_accuracy",
-            patience=5,
-            restore_best_weights=True
-        ),
-        ModelCheckpoint(
-            model_path,
-            monitor="val_accuracy",
-            save_best_only=True,
-            verbose=1
-        )
+        EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True),
+        ModelCheckpoint(model_path, monitor="val_accuracy", save_best_only=True, verbose=1)
     ]
 
     history = model.fit(
@@ -130,7 +111,6 @@ def main():
     with open(os.path.join(MODEL_DIR, "train_history.json"), "w", encoding="utf-8") as file:
         json.dump(history.history, file, ensure_ascii=False)
 
-    class_names = load_class_names()
     with open(os.path.join(MODEL_DIR, "class_indices.json"), "w", encoding="utf-8") as file:
         json.dump(train_data.class_indices, file, ensure_ascii=False)
 
@@ -138,5 +118,5 @@ def main():
     print("Сыныптар саны:", train_data.num_classes)
 
 
-if __main__ == "__main__":
+if __name__ == "__main__":
     main()
