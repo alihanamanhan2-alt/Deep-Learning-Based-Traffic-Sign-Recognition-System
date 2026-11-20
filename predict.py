@@ -1,66 +1,62 @@
-import os
-import json
-import cv2
-import numpy as np
-import tensorflow as tf
+"""Load trained PyTorch checkpoints and predict GTSRB classes."""
+from pathlib import Path
+from typing import Iterable, Dict, List
 
-IMG_SIZE = (32, 32)
-MODEL_PATH = os.path.join("models", "traffic_sign_model.keras")
+import torch
+from PIL import Image
 
-
-def load_model():
-    if not os.path.exists(MODEL_PATH):
-        raise FileNotFoundError(
-            "Модель табылмады. Алдымен python train.py командасын орындаңыз."
-        )
-    return tf.keras.models.load_model(MODEL_PATH)
+from src.model import build_model
+from src.preprocessing import build_transforms
 
 
-def get_class_names():
-    path = os.path.join("models", "class_indices.json")
-    if not os.path.exists(path):
-        return None
+class TrafficSignPredictor:
+    """Inference wrapper that validates checkpoints and shares preprocessing."""
 
-    with open(path, "r", encoding="utf-8") as file:
-        class_indices = json.load(file)
+    def __init__(self, weights: Path, device: str = "cpu"):
+        self.weights = Path(weights)
+        if not self.weights.is_file():
+            raise FileNotFoundError(
+                f"Model checkpoint not found: {self.weights}. Train a model first."
+            )
+        self.device = torch.device(device if device != "auto" else (
+            "cuda" if torch.cuda.is_available() else "cpu"
+        ))
+        checkpoint = torch.load(self.weights, map_location="cpu", weights_only=False)
+        self.model_name = str(checkpoint.get("model_name", "cnn"))
+        self.image_size = int(checkpoint.get("image_size", 64))
+        raw_names = checkpoint.get("class_names", {})
+        self.class_names: Dict[int, str] = {}
+        for i in range(43):
+            if isinstance(raw_names, dict):
+                if i in raw_names:
+                    self.class_names[i] = str(raw_names[i])
+                elif str(i) in raw_names:
+                    self.class_names[i] = str(raw_names[str(i)])
+                else:
+                    self.class_names[i] = f"Class {i}"
+            else:
+                self.class_names[i] = str(raw_names[i]) if i < len(raw_names) else f"Class {i}"
 
-    names = [None] * len(class_indices)
-    for name, index in class_indices.items():
-        names[index] = name
+        self.model = build_model(self.model_name, num_classes=43)
+        self.model.load_state_dict(checkpoint["model_state_dict"])
+        self.model.to(self.device)
+        self.model.eval()
+        _, self.transform = build_transforms(self.image_size)
 
-    custom_path = os.path.join("data", "class_names.json")
-    if os.path.exists(custom_path):
-        with open(custom_path, "r", encoding="utf-8") as file:
-            custom_names = json.load(file)
-        return custom_names
+    def predict_image(self, image: Image.Image, top_k: int = 5) -> Dict:
+        if not isinstance(image, Image.Image):
+            raise TypeError("image must be a PIL.Image.Image")
+        rgb = image.convert("RGB")
+        tensor = self.transform(rgb).unsqueeze(0).to(self.device)
+        with torch.inference_mode():
+            probabilities = torch.softmax(self.model(tensor), dim=1)[0]
+        values, indices = probabilities.topk(min(top_k, 43))
+        predictions = [
+            {"class_id": int(index), "label": self.class_names[int(index)],
+             "confidence": float(value)}
+            for value, index in zip(values.cpu(), indices.cpu())
+        ]
+        return predictions[0] | {"top_predictions": predictions}
 
-    return names
-
-
-def prepare_image(image):
-    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    image = cv2.resize(image, IMG_SIZE)
-    image = image.astype("float32") / 255.0
-    return np.expand_dims(image, axis=0)
-
-
-def predict_image(image):
-    model = load_model()
-    processed = prepare_image(image)
-    probabilities = model.predict(processed, verbose=0)[0]
-
-    class_id = int(np.argmax(probabilities))
-    confidence = float(probabilities[class_id])
-
-    names = get_class_names()
-    if names is not None and class_id < len(names):
-        label = names[class_id]
-    else:
-        label = f"Сынып {class_id}"
-
-    return {
-        "class_id": class_id,
-        "label": label,
-        "confidence": confidence,
-        "probabilities": probabilities
-    }
+    def predict_batch(self, images: Iterable[Image.Image], top_k: int = 5) -> List[Dict]:
+        return [self.predict_image(image, top_k=top_k) for image in images]

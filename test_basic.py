@@ -1,17 +1,36 @@
+import numpy as np
 import pytest
+from PIL import Image
+
+from src.model import build_model
+from src.preprocessing import build_transforms
 
 
-def test_predict_module_exists():
-    from predict import get_class_names
-    assert callable(get_class_names)
+def test_custom_cnn_output_shape():
+    import torch
+    model = build_model("cnn", num_classes=43)
+    output = model(torch.zeros(2, 3, 64, 64))
+    assert output.shape == (2, 43)
 
 
-def test_prepare_image_shape():
-    import cv2
-    import numpy as np
-    from predict import prepare_image
+def test_resnet18_output_shape():
+    import torch
+    model = build_model("resnet18", num_classes=43, pretrained=False)
+    output = model(torch.zeros(2, 3, 64, 64))
+    assert output.shape == (2, 43)
 
-    image = np.zeros((100, 100, 3), dtype=np.uint8)
-    result = prepare_image(image)
 
-    assert result.shape == (1, 32, 32, 3)
+def test_preprocessing_output_shape():
+    import torch
+    train_transform, eval_transform = build_transforms(64)
+    image = Image.fromarray(np.zeros((100, 120, 3), dtype=np.uint8), "RGB")
+    tensor = eval_transform(image)
+    assert isinstance(tensor, torch.Tensor)
+    assert tensor.shape == (3, 64, 64)
+
+
+def test_checkpoint_prediction_guard(tmp_path):
+    from predict import TrafficSignPredictor
+    missing = tmp_path / "missing.pth"
+    with pytest.raises(FileNotFoundError):
+        TrafficSignPredictor(missing)

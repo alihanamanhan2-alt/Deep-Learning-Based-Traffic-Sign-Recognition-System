@@ -1,121 +1,120 @@
-import os
+"""Train a custom CNN or ResNet18 on GTSRB."""
+import argparse
 import json
-import random
-import numpy as np
-import tensorflow as tf
-from tensorflow.keras import layers, models
-from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint
-from tensorflow.keras.preprocessing.image import ImageDataGenerator
+from pathlib import Path
 
-SEED = 42
-IMG_SIZE = (32, 32)
-BATCH_SIZE = 64
-EPOCHS = 25
-DATA_DIR = "data"
-MODEL_DIR = "models"
+import torch
+import torch.nn as nn
+from tqdm import tqdm
 
-random.seed(SEED)
-np.random.seed(SEED)
-tf.random.set_seed(SEED)
-os.makedirs(MODEL_DIR, exist_ok=True)
+from config import (BATCH_SIZE, DATA_DIR, EPOCHS, IMAGE_SIZE, MODEL_DIR,
+                    RESULTS_DIR, SEED)
+from src.dataset import create_dataloaders
+from src.model import build_model
+from src.utils import get_device, save_checkpoint, seed_everything
 
 
-def build_model(num_classes):
-    model = models.Sequential([
-        layers.Input(shape=(32, 32, 3)),
-        layers.Conv2D(32, (3, 3), activation="relu", padding="same"),
-        layers.BatchNormalization(),
-        layers.Conv2D(32, (3, 3), activation="relu", padding="same"),
-        layers.MaxPooling2D((2, 2)),
-        layers.Dropout(0.25),
+def run_epoch(model, loader, criterion, optimizer=None, device="cpu"):
+    """Run one training or validation epoch and return loss and accuracy."""
+    training = optimizer is not None
+    model.train(training)
+    total_loss = 0.0
+    correct = 0
+    total = 0
 
-        layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
-        layers.BatchNormalization(),
-        layers.Conv2D(64, (3, 3), activation="relu", padding="same"),
-        layers.MaxPooling2D((2, 2)),
-        layers.Dropout(0.25),
+    for images, labels in tqdm(loader, disable=not training):
+        images = images.to(device)
+        labels = labels.to(device)
+        if training:
+            optimizer.zero_grad(set_to_none=True)
 
-        layers.Flatten(),
-        layers.Dense(256, activation="relu"),
-        layers.BatchNormalization(),
-        layers.Dropout(0.5),
-        layers.Dense(num_classes, activation="softmax")
-    ])
+        with torch.set_grad_enabled(training):
+            outputs = model(images)
+            loss = criterion(outputs, labels)
+            if training:
+                loss.backward()
+                optimizer.step()
 
-    model.compile(
-        optimizer=tf.keras.optimizers.Adam(learning_rate=1e-3),
-        loss="categorical_crossentropy",
-        metrics=["accuracy"]
-    )
-    return model
+        total_loss += loss.item() * images.size(0)
+        correct += (outputs.argmax(1) == labels).sum().item()
+        total += labels.size(0)
+
+    return total_loss / total, correct / total
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train a GTSRB PyTorch model")
+    parser.add_argument("--model", choices=["cnn", "resnet18"], default="cnn")
+    parser.add_argument("--epochs", type=int, default=EPOCHS)
+    parser.add_argument("--batch-size", type=int, default=BATCH_SIZE)
+    parser.add_argument("--image-size", type=int, default=IMAGE_SIZE)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--pretrained", action="store_true",
+                        help="Initialize ResNet18 with torchvision ImageNet weights")
+    parser.add_argument("--data-dir", type=Path, default=DATA_DIR)
+    parser.add_argument("--device", default="auto")
+    return parser.parse_args()
 
 
 def main():
-    train_dir = os.path.join(DATA_DIR, "Train")
-    if not os.path.isdir(train_dir):
-        raise FileNotFoundError(
-            "data/Train каталогын табу мүмкін емес. GTSRB деректерін README нұсқаулығына сай орналастырыңыз."
+    args = parse_args()
+    if args.epochs < 1:
+        raise ValueError("--epochs must be at least 1")
+    seed_everything(SEED)
+    device = get_device(args.device)
+
+    train_loader, val_loader, _, class_names = create_dataloaders(
+        data_dir=args.data_dir,
+        image_size=args.image_size,
+        batch_size=args.batch_size,
+        seed=SEED,
+    )
+    model = build_model(args.model, num_classes=len(class_names), pretrained=args.pretrained)
+    model = model.to(device)
+
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="max", factor=0.5, patience=2,
+    )
+
+    history = {"loss": [], "accuracy": [], "val_loss": [], "val_accuracy": []}
+    best_accuracy = -1.0
+    checkpoint_path = MODEL_DIR / f"{args.model}_best.pth"
+
+    for epoch in range(1, args.epochs + 1):
+        train_loss, train_accuracy = run_epoch(
+            model, train_loader, criterion, optimizer, device,
+        )
+        val_loss, val_accuracy = run_epoch(
+            model, val_loader, criterion, device=device,
+        )
+        scheduler.step(val_accuracy)
+
+        history["loss"].append(train_loss)
+        history["accuracy"].append(train_accuracy)
+        history["val_loss"].append(val_loss)
+        history["val_accuracy"].append(val_accuracy)
+
+        print(
+            f"Epoch {epoch:02d}/{args.epochs} | "
+            f"train_loss={train_loss:.4f} train_acc={train_accuracy:.4f} | "
+            f"val_loss={val_loss:.4f} val_acc={val_accuracy:.4f}"
         )
 
-    datagen = ImageDataGenerator(
-        rescale=1.0 / 255,
-        validation_split=0.2,
-        rotation_range=10,
-        width_shift_range=0.1,
-        height_shift_range=0.1,
-        zoom_range=0.1,
-        brightness_range=(0.8, 1.2)
-    )
+        if val_accuracy > best_accuracy:
+            best_accuracy = val_accuracy
+            save_checkpoint(
+                checkpoint_path, model, args.model, class_names,
+                args.image_size, history=history,
+            )
 
-    train_data = datagen.flow_from_directory(
-        train_dir,
-        target_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode="categorical",
-        subset="training",
-        shuffle=True,
-        seed=SEED
-    )
-
-    validation_data = datagen.flow_from_directory(
-        train_dir,
-        target_size=IMG_SIZE,
-        batch_size=BATCH_SIZE,
-        class_mode="categorical",
-        subset="validation",
-        shuffle=False,
-        seed=SEED
-    )
-
-    if train_data.num_classes < 2:
-        raise ValueError("Оқыту деректерінде кемінде екі сынып болуы керек.")
-
-    os.makedirs(MODEL_DIR, exist_ok=True)
-    model_path = os.path.join(MODEL_DIR, "traffic_sign_model.keras")
-    model = build_model(train_data.num_classes)
-
-    callbacks = [
-        EarlyStopping(monitor="val_accuracy", patience=5, restore_best_weights=True),
-        ModelCheckpoint(model_path, monitor="val_accuracy", save_best_only=True, verbose=1)
-    ]
-
-    history = model.fit(
-        train_data,
-        epochs=EPOCHS,
-        validation_data=validation_data,
-        callbacks=callbacks
-    )
-
-    model.save(model_path)
-
-    with open(os.path.join(MODEL_DIR, "train_history.json"), "w", encoding="utf-8") as file:
-        json.dump(history.history, file, ensure_ascii=False)
-
-    with open(os.path.join(MODEL_DIR, "class_indices.json"), "w", encoding="utf-8") as file:
-        json.dump(train_data.class_indices, file, ensure_ascii=False)
-
-    print("Модель сақталды:", model_path)
-    print("Сыныптар саны:", train_data.num_classes)
+    (RESULTS_DIR / args.model).mkdir(parents=True, exist_ok=True)
+    history_path = RESULTS_DIR / args.model / "history.json"
+    history_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+    print(f"Best validation accuracy: {best_accuracy:.4f}")
+    print(f"Weights: {checkpoint_path}")
+    print(f"History: {history_path}")
 
 
 if __name__ == "__main__":
