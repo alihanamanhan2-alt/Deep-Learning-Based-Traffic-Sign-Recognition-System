@@ -1,0 +1,16 @@
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.pytest_cache/
+.DS_Store
+
+# Dataset and generated artifacts are intentionally not committed.
+data/raw/**
+data/processed/**
+models/*.pth
+results/*.png
+results/*.json
+results/*.txt
+screenshots/
